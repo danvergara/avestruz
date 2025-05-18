@@ -28,9 +28,20 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - avestruz
+  redis:
+    image: redis:8.0
+    restart: always
+    command: redis-server --requirepass password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - avestruz
 
 volumes:
   postgres_data:
+  redis-data:
 
 networks:
   avestruz:
