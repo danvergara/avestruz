@@ -5,20 +5,29 @@ Copyright © 2025 Dan Vergara danvergara@nostrplebs.com
 package cmd
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/fiatjaf/eventstore/postgresql"
 	"github.com/fiatjaf/khatru"
 	"github.com/fiatjaf/khatru/policies"
+	"github.com/jmoiron/sqlx"
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 )
 
 var (
-	dbURL  string
-	driver string
-	port   string
+	dbURL              string
+	driver             string
+	port               string
+	chacheURL          string
+	ErrDuplicatedEvent = errors.New("duplicated event")
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -38,15 +47,95 @@ var rootCmd = &cobra.Command{
 
 		db := postgresql.PostgresBackend{DatabaseURL: dbURL}
 
+		opts, err := redis.ParseURL(chacheURL)
+		if err != nil {
+			return err
+		}
+
+		dbClient, err := sqlx.Connect("postgres", dbURL)
+		if err != nil {
+			return err
+		}
+
+		client := redis.NewClient(opts)
+
 		if err := db.Init(); err != nil {
 			return err
 		}
 
 		// set up the basic relay functions
-		relay.StoreEvent = append(relay.StoreEvent, db.SaveEvent)
-		relay.QueryEvents = append(relay.QueryEvents, db.QueryEvents)
-		relay.DeleteEvent = append(relay.DeleteEvent, db.DeleteEvent)
+		// relay.StoreEvent = append(relay.StoreEvent, db.SaveEvent)
+		relay.StoreEvent = append(relay.StoreEvent,
+			func(ctx context.Context, event *nostr.Event) error {
+				const query = `INSERT INTO event (
+					id, pubkey, created_at, kind, tags, content, sig)
+					VALUES ($1, $2, $3, $4, $5, $6, $7)
+					ON CONFLICT (id) DO NOTHING`
 
+				var (
+					tagsj, _ = json.Marshal(event.Tags)
+					params   = []any{
+						event.ID,
+						event.PubKey,
+						event.CreatedAt,
+						event.Kind,
+						tagsj,
+						event.Content,
+						event.Sig,
+					}
+				)
+
+				res, err := dbClient.ExecContext(ctx, query, params...)
+				if err != nil {
+					return err
+				}
+
+				nr, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+
+				if nr == 0 {
+					return ErrDuplicatedEvent
+				}
+
+				cacheKey := fmt.Sprintf("event:%s", event.ID)
+				client.HMSet(ctx, cacheKey, map[string]any{
+					"pubkey":     event.PubKey,
+					"created_at": event.CreatedAt,
+					"kind":       event.Kind,
+					"tags":       tagsj,
+					"content":    event.Content,
+					"sig":        event.Sig,
+				})
+
+				client.Expire(ctx, cacheKey, time.Hour)
+
+				return nil
+			},
+		)
+
+		relay.QueryEvents = append(
+			relay.QueryEvents,
+			func(ctx context.Context, filter nostr.Filter) (chan *nostr.Event, error) {
+				ch := make(chan *nostr.Event)
+				go func() {
+					for _, id := range filter.IDs {
+						cacheKey := fmt.Sprintf("event:%s", id)
+						_, err := client.HGetAll(ctx, cacheKey).Result()
+						if err != nil {
+							return
+						}
+
+					}
+				}()
+
+				return ch, nil
+			},
+		)
+		// relay.QueryEvents = append(relay.QueryEvents, db.QueryEvents)
+
+		relay.DeleteEvent = append(relay.DeleteEvent, db.DeleteEvent)
 		relay.RejectEvent = append(relay.RejectEvent,
 			policies.ValidateKind,
 			policies.PreventLargeTags(100),
@@ -89,4 +178,5 @@ func init() {
 	rootCmd.Flags().StringVarP(&driver, "driver", "", "", "Database Driver")
 	rootCmd.Flags().StringVarP(&dbURL, "dburl", "", "", "Database DSN")
 	rootCmd.Flags().StringVarP(&port, "port", "", "", "Relay Port")
+	rootCmd.Flags().StringVarP(&chacheURL, "cache-url", "", "", "Cache URL")
 }
