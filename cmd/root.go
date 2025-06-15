@@ -119,6 +119,17 @@ var rootCmd = &cobra.Command{
 			relay.QueryEvents,
 			func(ctx context.Context, filter nostr.Filter) (chan *nostr.Event, error) {
 				ch := make(chan *nostr.Event)
+				go func() {
+					for _, id := range filter.IDs {
+						cacheKey := fmt.Sprintf("event:%s", id)
+						_, err := client.HGetAll(ctx, cacheKey).Result()
+						if err != nil {
+							return
+						}
+
+					}
+				}()
+
 				return ch, nil
 			},
 		)
